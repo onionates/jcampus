@@ -49,66 +49,101 @@ To publish: archive in Xcode → App Store Connect, or generate a signed AAB in 
 
 ---
 
-## 3. Connecting to the District's real grade API
+## 3. Connecting to St. Tammany Parish (JPAMS / JCampus)
 
-You said the district's site runs on **Apache Tomcat 7**. That tells you it's a Java web app — almost always one of: PowerSchool, JCampus (Edgear, common in Louisiana), Skyward, or Infinite Campus. The web pages you see are the front end; the actual data is fetched from REST or SOAP endpoints.
+Your district uses **JPAMS** at `https://jpams.stpsb.org` and the parent/student progress portal at `https://jpams.stpsb.org/progress`. Under the hood this is **JCampus by Edgear** — a SmartGWT (Java + GWT) app on Apache Tomcat. There is no public REST API; the browser talks to the server with **GWT-RPC** (a custom POST format, `Content-Type: text/x-gwt-rpc`) on endpoints like `/progress/com.edgear.Main/...`. Auth is a cookie-based session (`JSESSIONID`).
 
-### Step A — Find the real API
+That has two consequences:
 
-1. Open the existing district website in Chrome → **F12** → **Network** tab.
-2. Log in normally. Filter by `XHR` / `Fetch`.
-3. Look for requests like `/StudentClasses.action`, `/api/grades`, `/rest/...` returning JSON or XML. Those are your endpoints.
-4. Note the request URL, method, headers (especially `Cookie` / `Authorization`), and the request body.
+1. You **cannot** call JPAMS directly from the mobile app — GWT-RPC payloads aren't stable, CORS is not enabled, and the cookie can't be safely shared with a native app.
+2. You **must** put a server in the middle that logs in on behalf of the user, fetches the data, and returns clean JSON to the app.
 
-### Step B — Add a thin proxy (CRITICAL — never call Tomcat directly from the app)
+### Step A — Get permission first
+Email STPSB IT / the JPAMS administrator and ask:
+- Is there an official Edgear/JCampus API or data export available for parents/students?
+- Can you get **written approval** to build a read-only proxy that signs in on a user's behalf?
 
-You should **never** ship the district's credentials inside the mobile app, and Tomcat almost certainly won't have CORS enabled. Put a small backend in front of it.
+Don't skip this — scraping a student information system without authorization can violate FERPA and the district acceptable-use policy.
 
-The easiest path inside this project is **Lovable Cloud** (one click, includes serverless edge functions and secret storage). Ask Lovable to "enable Lovable Cloud" and then "create an edge function called `grades-proxy`" that:
+### Step B — Reverse-engineer the calls
+1. Open `https://jpams.stpsb.org/progress` in Chrome → **F12** → **Network** → check "Preserve log".
+2. Log in as a test student/parent.
+3. Click each tab (Grades, Attendance, Discipline, Schedule, Transcript, LEAP, Fees) and watch `/progress/com.edgear.Main/...` requests. For each one, save:
+   - The exact URL
+   - The headers (`X-GWT-Permutation`, `Content-Type: text/x-gwt-rpc`, `Cookie: JSESSIONID=…`)
+   - The full POST body (looks like `7|0|6|https://...|...`)
+   - The response body
+4. Right-click → Copy → **Copy as cURL** for each one — your proxy replays them.
 
-- Accepts the student's auth token from the app.
-- Forwards the request to `https://grades.yourdistrict.org/...` (your Tomcat host).
-- Returns the JSON to the app.
-- Stores the district admin/service credentials as secrets, **not** in source.
+### Step C — Build a proxy with Lovable Cloud
+Ask Lovable: **"Enable Lovable Cloud and create an edge function called `jpams-proxy`."** The function should:
+1. `POST` the user's username/password to the JPAMS login form, capture the `JSESSIONID` cookie.
+2. Replay the GWT-RPC calls captured in Step B, attaching that cookie.
+3. Parse the response and return clean JSON shaped like `src/data/mockData.ts`.
 
-Skeleton for the edge function:
+Skeleton:
 
 ```ts
-// supabase/functions/grades-proxy/index.ts
+// supabase/functions/jpams-proxy/index.ts
 import { corsHeaders } from "@supabase/supabase-js/cors";
+
+const BASE = "https://jpams.stpsb.org";
+
+async function login(username: string, password: string) {
+  const res = await fetch(`${BASE}/progress/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ username, password }).toString(),
+    redirect: "manual",
+  });
+  const setCookie = res.headers.get("set-cookie") ?? "";
+  const jsession = setCookie.match(/JSESSIONID=[^;]+/)?.[0];
+  if (!jsession) throw new Error("JPAMS login failed");
+  return jsession;
+}
+
+async function callGwt(jsession: string, body: string) {
+  const res = await fetch(`${BASE}/progress/com.edgear.Main/...`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "text/x-gwt-rpc; charset=utf-8",
+      "X-GWT-Permutation": "PASTE_FROM_DEVTOOLS",
+      Cookie: jsession,
+    },
+    body,
+  });
+  return await res.text(); // then parse the GWT-RPC response into JSON
+}
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
-
-  const { studentId, sessionCookie } = await req.json();
-  const res = await fetch(`https://grades.yourdistrict.org/api/student/${studentId}/grades`, {
-    headers: { Cookie: sessionCookie ?? "" },
-  });
-  const data = await res.json();
-  return new Response(JSON.stringify(data), {
+  const { username, password, action } = await req.json();
+  const jsession = await login(username, password);
+  // route `action` (grades, attendance, schedule, …) to the right GWT call,
+  // parse the response, normalize, and return JSON
+  return new Response(JSON.stringify({ ok: true }), {
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 });
 ```
 
-### Step C — Wire the app to the proxy
-
-Replace the imports in each page from `@/data/mockData` with a fetch hook. Example for grades:
+### Step D — Wire the app to the proxy
+Replace the imports in each page from `@/data/mockData` with a fetch hook:
 
 ```ts
 // src/hooks/useGrades.ts
 import { useQuery } from "@tanstack/react-query";
+import { supabase } from "@/integrations/supabase/client"; // exists once Cloud is enabled
 
-export const useGrades = (studentId: string) =>
+export const useGrades = () =>
   useQuery({
-    queryKey: ["grades", studentId],
+    queryKey: ["grades"],
     queryFn: async () => {
-      const res = await fetch("/api/grades-proxy", {
-        method: "POST",
-        body: JSON.stringify({ studentId }),
+      const { data, error } = await supabase.functions.invoke("jpams-proxy", {
+        body: { action: "grades" },
       });
-      if (!res.ok) throw new Error("Failed to load grades");
-      return res.json();
+      if (error) throw error;
+      return data;
     },
   });
 ```
@@ -116,20 +151,23 @@ export const useGrades = (studentId: string) =>
 Then in `Grades.tsx`:
 
 ```ts
-const { data: grades, isLoading } = useGrades(settings.studentId);
-if (isLoading) return <p>Loading…</p>;
+const { data: grades, isLoading } = useGrades();
+if (isLoading) return <p className="p-4 text-sm text-muted-foreground">Loading…</p>;
 ```
 
-Keep the **shape** of `mockData.ts` the same as the API response (or transform inside the proxy) and the UI keeps working.
+Keep the response shape identical to `mockData.ts` and every page keeps working.
 
-### Step D — Auth
+### Step E — Storing the JPAMS password securely
+- On the device: use `@capacitor-community/secure-storage` (iOS Keychain / Android EncryptedSharedPreferences). **Never** `localStorage`.
+- On the server: don't persist it if you can avoid it — log in fresh each session. If you must cache it, encrypt with a per-user key derived from the user's app login.
 
-Tomcat apps usually authenticate with username/password → session cookie (`JSESSIONID`). Two options:
+### Realistic alternative
+Reverse-engineering GWT-RPC is fragile (payloads can change with each JCampus release). The most robust path is to ask STPSB IT to:
+- Enable the **Edgear/JCampus REST API** (Edgear ships one for districts that request it), or
+- Provide a nightly CSV / SFTP export you can import into Lovable Cloud.
 
-1. **Best:** ask the district IT for a real REST API or OAuth2 endpoint. Most modern SIS vendors expose one.
-2. **Bridge:** in the proxy, log into the Tomcat app on behalf of the user (`POST /j_security_check` with username/password), capture `JSESSIONID`, then reuse it for subsequent calls. Store the password in the device's secure keychain (Capacitor Preferences with encryption, or `@capacitor-community/secure-storage`), **never** in plain `localStorage`.
+> ⚠️ Build only with written permission from the district. FERPA applies.
 
-> ⚠️ Do this only with written permission from your district's IT department. Scraping or proxying without authorization can violate FERPA and the district's acceptable-use policy.
 
 ---
 
