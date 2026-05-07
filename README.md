@@ -176,7 +176,205 @@ Reverse-engineering GWT-RPC is fragile (payloads can change with each JCampus re
 - **New row on an existing page:** open `src/data/mockData.ts`, add a key, then add `<Row label="..." value={data.newKey} />` in the page.
 - **New page:**
   1. Add a file in `src/pages/` (copy `Fees.tsx` as a template).
-  2. Add a `<Route>` in `src/App.tsx`.
+  2. Add a `<Route>` in `src/App.tsx` (wrap with `<RequireSetup>` if it requires login).
   3. Add an entry to `NAV_ITEMS` in `src/components/MobileLayout.tsx`.
 
-That's it.
+---
+
+## 5. App flow: Login → Onboarding → App
+
+The app now boots through three gates managed by `SettingsContext`:
+
+1. **`/login`** — `src/pages/Login.tsx`
+   - Username + password (currently mocked, see comment for the real `supabase.functions.invoke("jpams-proxy", { body: { action: "login", … } })` call).
+   - Toggle to enable **Face / Touch ID** (stored in `settings.biometricEnabled`).
+   - Square logo placeholder at the top — replace the placeholder `<div>` with `<img src="/logo.png" />`.
+
+2. **`/welcome`** — `src/pages/Welcome.tsx`
+   - 5-step onboarding with a thin progress bar pinned to the bottom.
+   - Steps: Tour → Theme → Grade → Notifications → Done.
+   - The "Get started" button on the last step writes `onboardingComplete = true` and redirects to `/`.
+
+3. **`/`** and every other page is wrapped with `<RequireSetup>` (`src/components/RequireSetup.tsx`):
+   - Not logged in → `/login`
+   - Logged in but onboarding not complete → `/welcome`
+   - Otherwise renders the page.
+
+To add a new gated page, wrap it the same way in `App.tsx`.
+
+---
+
+## 6. Theming: 4 presets + unlimited custom tonal themes
+
+Themes live in two places:
+
+- **Presets** (`navy`, `dark`, `cream`, `white`) — defined in `src/index.css` as `[data-theme="…"]` blocks of HSL CSS variables.
+- **Custom tonal theme** — when `settings.theme === "custom"`, `SettingsContext` calls `buildTonalTheme()` from `src/lib/tonalTheme.ts`, which derives a full palette (background, surface, primary, border, etc.) from one base hex color plus a `light`/`dark` mode, and writes the values inline to `<html style="…">`.
+
+To add another preset:
+
+1. Add a new `[data-theme="my-theme"] { … }` block in `src/index.css` (copy any existing block and tweak HSL values).
+2. Add it to the `themes` array in `src/pages/Settings.tsx` and `PRESETS` in `src/pages/Welcome.tsx`.
+3. Add `"my-theme"` to the `ThemeName` union in `src/contexts/SettingsContext.tsx` and to `STATIC_THEMES` so it skips the tonal generator.
+
+To tweak how the custom palette is generated, edit `buildTonalTheme()` — the function returns the complete CSS variable map, so any visual decision is one place.
+
+---
+
+## 7. Real loading states (per-page + per-route)
+
+There are two loading layers:
+
+- **Route-level:** every page is `lazy()`-imported in `App.tsx` and rendered inside `<Suspense fallback={<FullscreenLoader/>}>`. Switching tabs or pages shows the real spinner while the chunk + lazy data loads.
+- **Page-level:** use the hooks in `src/hooks/useDistrictData.ts` (`useGrades`, `useAttendance`, `useStudent`, …). Today they return mock data after a short delay; swap each `queryFn` body for the `supabase.functions.invoke("jpams-proxy", …)` call shown in §3 and you get real loading states with `react-query` automatically (`isLoading`, `isFetching`, retries, caching).
+
+Example for `Grades.tsx`:
+
+```tsx
+import { useGrades } from "@/hooks/useDistrictData";
+import { InlineLoader } from "@/components/Loader";
+
+const { data: grades, isLoading } = useGrades();
+if (isLoading) return <InlineLoader label="Loading grades…" />;
+```
+
+This is the pattern other developers should reuse for any new page or data source — never write fake `setTimeout` UIs.
+
+---
+
+## 8. Grade-aware features
+
+`settings.grade` (set during onboarding, editable in Settings) drives feature gating:
+
+- **LEAP / state testing page** (`/test-scores`) is hidden for grades K–4 (shows a friendly "not available" screen with a link to Settings).
+- For **grades 5–8**, the achievement-level reference table shows the cut-score range from LDOE's 2025 Interpretive Guide (`src/data/leapCutScores.ts`).
+- For **grades 9–12**, the page swaps to high-school courses (Algebra I, English I, Geometry, English II, US History, Biology) and uses the high-school cut-score conversion table.
+
+To gate any other page on grade:
+
+```tsx
+import { useSettings } from "@/contexts/SettingsContext";
+const { settings } = useSettings();
+if (Number(settings.grade) < 9) return <NotForGrade />;
+```
+
+Update the cut-score data once a year by editing `src/data/leapCutScores.ts` against the latest [LDOE Assessment publications](https://doe.louisiana.gov/families-and-students/assessment).
+
+---
+
+## 9. Full JPAMS edge-function example (deeper than §3)
+
+Below is a more complete `jpams-proxy` skeleton you can drop into Lovable Cloud once you've captured the GWT-RPC payloads in DevTools (§3 Step B). It logs in once, caches the `JSESSIONID` per user request, and exposes one entry point per page.
+
+```ts
+// supabase/functions/jpams-proxy/index.ts
+import { corsHeaders } from "@supabase/supabase-js/cors";
+
+const BASE = "https://jpams.stpsb.org";
+
+interface Action {
+  path: string;          // e.g. "/progress/com.edgear.Main/grades"
+  permutation: string;   // X-GWT-Permutation header value
+  body: string;          // GWT-RPC body, including |placeholders| you replace
+}
+
+// Fill these in using `Copy as cURL` from Chrome DevTools.
+const ACTIONS: Record<string, Action> = {
+  grades:        { path: "/progress/com.edgear.Main/...", permutation: "XXXX", body: "7|0|6|..." },
+  attendance:    { path: "/progress/com.edgear.Main/...", permutation: "XXXX", body: "7|0|6|..." },
+  schedule:      { path: "/progress/com.edgear.Main/...", permutation: "XXXX", body: "7|0|6|..." },
+  discipline:    { path: "/progress/com.edgear.Main/...", permutation: "XXXX", body: "7|0|6|..." },
+  transcript:    { path: "/progress/com.edgear.Main/...", permutation: "XXXX", body: "7|0|6|..." },
+  testscores:    { path: "/progress/com.edgear.Main/...", permutation: "XXXX", body: "7|0|6|..." },
+  fees:          { path: "/progress/com.edgear.Main/...", permutation: "XXXX", body: "7|0|6|..." },
+  communications:{ path: "/progress/com.edgear.Main/...", permutation: "XXXX", body: "7|0|6|..." },
+  student:       { path: "/progress/com.edgear.Main/...", permutation: "XXXX", body: "7|0|6|..." },
+};
+
+async function login(username: string, password: string): Promise<string> {
+  // 1. GET the login page first — JCampus often issues a JSESSIONID cookie + CSRF token.
+  const initial = await fetch(`${BASE}/progress/`, { redirect: "manual" });
+  const initialCookie = (initial.headers.get("set-cookie") ?? "").match(/JSESSIONID=[^;]+/)?.[0] ?? "";
+
+  // 2. POST credentials to the form action observed in DevTools.
+  const res = await fetch(`${BASE}/progress/login`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Cookie": initialCookie,
+    },
+    body: new URLSearchParams({ username, password }).toString(),
+    redirect: "manual",
+  });
+  const finalCookie = (res.headers.get("set-cookie") ?? "").match(/JSESSIONID=[^;]+/)?.[0];
+  if (!finalCookie) throw new Error("JPAMS login failed — check credentials and form fields");
+  return finalCookie;
+}
+
+async function callGwt(jsession: string, a: Action): Promise<string> {
+  const res = await fetch(`${BASE}${a.path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "text/x-gwt-rpc; charset=utf-8",
+      "X-GWT-Permutation": a.permutation,
+      "Cookie": jsession,
+    },
+    body: a.body,
+  });
+  const text = await res.text();
+  if (!res.ok || text.startsWith("//EX")) {  // GWT-RPC error responses start with //EX
+    throw new Error(`JPAMS ${a.path} failed: ${res.status} ${text.slice(0, 200)}`);
+  }
+  return text;
+}
+
+// Convert the raw GWT-RPC text response into the shape used by `src/data/mockData.ts`.
+// You'll write one parser per action, based on the captured response.
+const PARSERS: Record<string, (raw: string) => unknown> = {
+  grades: (raw) => {
+    // Example: GWT-RPC responses look like //OK[1,["English II", ...],0,7]
+    // Strip the //OK header, JSON.parse, then walk the array.
+    return { courses: [] };
+  },
+  // …implement parsers for the other actions.
+};
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
+  try {
+    const { username, password, action } = await req.json();
+    if (!ACTIONS[action]) throw new Error(`Unknown action: ${action}`);
+
+    const jsession = await login(username, password);
+    const raw = await callGwt(jsession, ACTIONS[action]);
+    const data = PARSERS[action]?.(raw) ?? raw;
+
+    return new Response(JSON.stringify({ ok: true, data }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ ok: false, error: (err as Error).message }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+});
+```
+
+### Production hardening
+
+- **Rate-limit per user** (KV / `upstash-redis`) — JPAMS has no public API and will block aggressive polling.
+- **Cache responses for 30–120 s** server-side. Most pages don't need real-time data.
+- **Re-use sessions** — store `JSESSIONID` in an encrypted cookie or per-user KV with a 5-minute TTL so you don't log in on every request.
+- **Audit log** every fetch with `{ user, action, status, durationMs }`. Districts will ask for this.
+- **Multi-district support** — make `BASE` configurable per workspace so the same edge function can serve other Louisiana districts running JCampus (Jefferson Parish, East Baton Rouge, Lafayette, etc. — they all use `*.jcampus.com` or a `/progress` subpath under their own domain).
+
+### What to ask STPSB / Edgear for
+
+The cleanest path is still to ask STPSB IT (and CC Edgear support) for:
+
+1. **Edgear JCampus REST API access** — Edgear has shipped a REST surface for districts that request it; using it removes all the GWT-RPC fragility above.
+2. **Read-only OAuth2 / SAML SSO** so end-users authenticate against the district's identity provider instead of your edge function holding their JPAMS password.
+3. **A nightly CSV / SFTP export** of the data you actually need — you ingest it into Lovable Cloud (one Postgres row per student per night) and the app reads from there. This eliminates real-time scraping entirely.
+
+> ⚠️ Build only with written permission from the district. JPAMS data is FERPA-protected.
